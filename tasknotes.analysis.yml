@@ -1,0 +1,588 @@
+# tasknotes.analysis.yml — jlnotion.plugin-analyzer v1
+# Generated: 2026-06-06
+
+meta:
+  plugin_id: tasknotes
+  plugin_name: TaskNotes
+  version: 4.10.2
+  author: Callum Alpass
+  min_app_version: "1.12.2"
+  desktop_only: false
+  loc_total: 276711
+  loc_src_ts: 88958
+  top_files_by_loc:
+    - { file: e2e/tasknotes.spec.ts,                       loc: 9174 }
+    - { file: src/bases/KanbanView.ts,                     loc: 4341 }
+    - { file: src/api/TaskNotesAPI.ts,                     loc: 3433 }
+    - { file: src/bases/CalendarView.ts,                   loc: 3089 }
+    - { file: src/services/TaskCalendarSyncService.ts,     loc: 3048 }
+    - { file: src/bases/TaskListView.ts,                   loc: 2898 }
+  external_deps:
+    - chrono-node        # NLP date parsing
+    - date-fns           # date utilities
+    - fullcalendar       # calendar UI
+    - ical / node-ical   # ICS parsing
+    - rrule              # RFC 5545 recurrence
+    - yaml               # frontmatter parse/write
+    - "@codemirror/*"    # editor extensions
+    - obsidian-daily-notes-interface  # daily-notes integration
+    - "@tasknotes/model" # external spec model (git submodule, NPM)
+  key_source_dirs:
+    - src/core/           # FieldMapper, VaultMutationService
+    - src/services/       # TaskService, PomodoroService, ICSSubscriptionService, TaskCalendarSyncService…
+    - src/services/task-service/  # planning modules (create, update, archive, time-tracking, recurrence)
+    - src/utils/TaskManager.ts    # just-in-time cache (metadataCache-backed)
+    - src/bases/          # KanbanView, CalendarView, TaskListView (Bases integration)
+    - src/api/            # HTTP REST + MCP runtime API
+    - src/bootstrap/      # service wiring + lifecycle
+
+mechanics:
+  entrypoints:
+    - ribbon: calendar-days → activateCalendarView
+    - ribbon: calendar → openBasesFileForCommand("open-advanced-calendar-view")
+    - ribbon: check-square → openBasesFileForCommand("open-tasks-view")
+    - ribbon: columns-3 → openBasesFileForCommand("open-kanban-view")
+    - ribbon: timer → activatePomodoroView
+    - ribbon: tasknotes-simple → openTaskCreationModal
+    - commands: TranslatedCommandRegistry (create task, open views, etc.)
+    - http_api: HTTPAPIService (localhost, configurable port) — TasksController, BasesController, etc.
+    - mcp: runtime-api TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS
+    - editor: CodeMirror extensions — TaskLinkOverlay, InstantConvertButtons, RelationshipsDecorations
+    - markdown_post_processor: ReadingModeTaskLinkProcessor
+
+  flow_task_create:
+    trigger: modal / HTTP POST / inline-convert / CLI
+    steps:
+      1: TaskCreationService.create() — assemble TaskCreationData
+      2: applyTaskCreationDefaults (status, priority, folder template)
+      3: processTemplate → build YAML frontmatter + body
+      4: vault.create(fullPath, content)   # ← file write
+      5: TaskManager receives metadataCache "changed" event (debounced 300ms)
+      6: emit EVENT_TASK_UPDATED + "data-changed"
+      7: optional Google/Microsoft Calendar sync via TaskCalendarSyncService
+
+  flow_task_update:
+    trigger: modal save / direct frontmatter edit / HTTP PATCH / Bases drag-drop
+    steps:
+      1: TaskService.updateTask() / TaskUpdateService.run()
+      2: build plan (property/archive/time-tracking/recurrence planning modules)
+      3: fileManager.processFrontMatter(file, patchFn)   # ← atomic frontmatter patch
+      4: optional vault.modify(file, newContent)          # body rewrite (e.g. recurrence reset)
+      5: optional fileManager.renameFile (title/archive move)
+      6: pendingTaskInfoByPath set (write-through cache — cleared when metadataCache confirms)
+      7: emit EVENT_TASK_UPDATED
+
+  flow_task_delete:
+    steps:
+      1: fileManager.trashFile(file)
+      2: metadataCache "deleted" → handleFileDeleted → emit "file-deleted" + "data-changed"
+
+  flow_task_read:
+    authority: TaskManager.getTaskInfo(path)
+    resolution_order:
+      1: pendingTaskInfoByPath (write-ahead buffer — in-memory Map)
+      2: metadataCache.getFileCache(file).frontmatter   # primary path
+      3: vault.read(file) YAML parse (fallback if cache not ready)
+    note: No SQLite, no secondary DB — metadataCache IS the index
+
+  flow_pomodoro:
+    storage: plugin.loadData() / plugin.saveData()   # data.json
+    note: Optionally writes pomodoro session history to daily-note frontmatter (processFrontMatter)
+
+  flow_ics:
+    storage: plugin.loadData() / plugin.saveData()   # ICSCache in data.json
+    note: Subscriptions (remote URL or local file) cached in-memory Map<subscriptionId, ICSCache>
+
+  flow_google_calendar_sync:
+    trigger: task create/update/delete events (configurable)
+    storage: googleCalendarEventId / googleCalendarExceptionEventId in task frontmatter
+    recovery_queue: pendingGoogleCalendarSync / pendingGoogleCalendarDeletion in data.json
+
+  flow_saved_views:
+    storage: data.json (ViewStateManager.saveSavedViews)
+
+  task_shape:
+    identity: path (TFile.path)  # ← D1: path-as-identity; no surrogate ID
+    frontmatter_fields: |
+      title, status, priority, due (YYYY-MM-DD), scheduled (YYYY-MM-DD),
+      tags[], contexts[], projects[], recurrence (RFC 5545), recurrence_anchor,
+      complete_instances[], skipped_instances[], recurrence_parent,
+      occurrence_date, occurrence_materialization, occurrence_next_trigger,
+      occurrence_template, occurrence_past_horizon, occurrence_future_horizon,
+      completedDate, timeEstimate (minutes), timeEntries[{startTime,endTime,description}],
+      dateCreated (ISO), dateModified (ISO),
+      blockedBy[{uid,reltype,gap}], sortOrder (LexoRank),
+      reminders[{id,type,relatedTo,offset,absoluteTime}],
+      googleCalendarEventId, googleCalendarExceptionEventId,
+      googleCalendarMovedOriginalDates, googleCalendarExceptionOriginalScheduled,
+      icsEventId[]
+    field_mapping: user-configurable via FieldMapping (all keys remappable)
+    identification_method: tag (default "task") OR property (configurable key+value)
+
+  timeblock_shape:
+    location: daily-note frontmatter (timeblocks: TimeBlock[])
+    fields: id, title, startTime (HH:MM), endTime (HH:MM), attachments[], color, description
+
+  pomodoro_shape:
+    location: data.json (key: pomodoroHistory) OR daily-note frontmatter (pomodoros key)
+    fields: PomodoroSession/PomodoroSessionHistory (id, taskPath, startTime, endTime, type, completed, activePeriods[])
+
+  ics_shape:
+    location: data.json (key: icsCaches)
+    fields: ICSCache{subscriptionId, events[ICSEvent{id,subscriptionId,title,start,end,allDay,rrule}], lastUpdated, expires}
+
+  saved_views_shape:
+    location: data.json
+    fields: SavedView{id, name, query: FilterQuery{sortKey,sortDirection,groupKey,children:FilterNode[]}}
+
+defects:
+  D1:
+    title: Path-as-identity
+    detail: >
+      TaskInfo.id is set to file.path (TaskManager line 200, 313).
+      On rename, pendingTaskInfoByPath re-keys by newPath but all existing
+      cross-references (blockedBy.uid, projects[], recurrence_parent) remain as the old
+      wikilink or markdown-link string. metadataCache-based resolvers may or may not
+      follow renames depending on Obsidian's link-update setting.
+    scope: creates + reads; blockedBy.uid resolution; recurrence_parent
+    fix: use blocks.id FK from jlnotion; resolve path via join at read time
+
+  D2:
+    title: Write-echo risk on processFrontMatter
+    detail: >
+      TaskService calls fileManager.processFrontMatter in ~8 places. This fires
+      metadataCache "changed", which triggers TaskManager.handleFileChangedDebounced.
+      pendingTaskInfoByPath provides a write-through buffer to suppress stale reads
+      (shouldUsePendingTaskInfo checks dateModified mismatch), but the event still
+      propagates through "data-changed" and re-renders all views.
+      Debounce is 300ms — rapid successive writes (recurrence + title + archive) can
+      queue multiple render cycles.
+    scope: TaskService, TaskUpdateService, KanbanView (direct processFrontMatter call line 3728)
+    fix: jlnotion WriteGuard must mark paths in-flight; suppress "data-changed" re-broadcast
+         until pendingTaskInfoByPath is cleared
+
+  D3:
+    title: data.json conflates heterogeneous state
+    detail: >
+      Pomodoro history, ICS cache, OAuth tokens, saved views, auto-archive queue,
+      Google Calendar recovery queues, and settings all share data.json via
+      plugin.loadData() / saveData(). Concurrent load/mutate/save sequences are
+      not guarded by a lock — e.g., AutoArchiveService, OAuthService, PomodoroService
+      each do independent read-modify-write cycles.
+    scope: AutoArchiveService, OAuthService, PomodoroService, ICSSubscriptionService, ViewStateManager
+    fix: extract each domain into a dedicated scoped key with optimistic-lock (ETag/version);
+         jlnotion maps each to a separate table/scope
+
+  D4:
+    title: LexoRank sortOrder stored as string in frontmatter
+    detail: >
+      KanbanView writes `sortOrder` (LexoRank string) into task frontmatter.
+      This is a render-order concern, not task identity. It bloats frontmatter and
+      triggers D2 re-render on every drag-drop.
+    fix: render_only column in cache; not written to vault files
+
+  D5:
+    title: timeEntries[] grows unbounded in frontmatter
+    detail: >
+      Each time-tracking start/stop appends a TimeEntry to the timeEntries array in
+      frontmatter. Large task files accumulate many entries with no pruning/archival.
+    fix: separate time_entries table in cache; frontmatter stores only active entry + total
+
+  D6:
+    title: googleCalendarMovedOriginalDates array grows unbounded in frontmatter
+    detail: >
+      Moved recurring event original dates are appended to frontmatter array with no
+      expiry/pruning. Purely a recovery hint for GCal sync.
+    fix: out_of_db_scope or a separate gcal_recovery_queue table; not in main task row
+
+tiers:
+  tier1_direct:
+    - source: src/core/FieldMapper.ts
+      adopt_into: indexer/resolver
+      value: Complete bidirectional frontmatter↔TaskInfo mapping with user remapping support
+      change: none; already stateless pure mapping
+
+    - source: src/core/recurrence.ts + @tasknotes/model recurrence ops
+      adopt_into: indexer/resolver
+      value: RFC 5545 RRULE complete_instances/skipped_instances materialization model
+      change: use as reference; do not import directly (external dep rrule)
+
+    - source: src/utils/TaskManager.ts (metadataCache event handling + debounce pattern)
+      adopt_into: indexer event layer
+      value: Proven write-ahead buffer pattern (pendingTaskInfoByPath); debounce timing
+      change: replace path-as-key with blocks.id; fix D2
+
+    - source: src/bases/sortOrderUtils.ts (LexoRank)
+      adopt_into: render layer only
+      value: Drag-drop ordering algorithm
+      change: mark render_only:true; never write to frontmatter (fix D4)
+
+    - source: FilterQuery / FilterCondition / FilterGroup tree (src/types.ts)
+      adopt_into: filter engine
+      value: Well-specified recursive filter AST; covers all standard task properties + user fields
+      change: none for logic; swap path references to blocks.id FKs
+
+    - source: TaskInfo / TaskFrontmatter shape (src/types.ts)
+      adopt_into: jlnotion tasks table schema
+      value: Canonical field set (30+ fields); recurrence model; dependency model; time entries
+      change: normalize arrays to child tables (timeEntries, reminders, blockedBy); fix D1/D5
+
+  tier2_adapt:
+    - source: src/services/task-service/ planning modules (archive, time-tracking, recurrence, blocking)
+      adopt_into: write-guard / operation layer
+      value: Pure plan-then-execute pattern; plan objects are serializable
+      change: replace direct fileManager calls with WriteGuard-wrapped vault writes
+
+    - source: src/services/PomodoroService.ts (session lifecycle + stats)
+      adopt_into: pomodoro_sessions table
+      value: Complete pomodoro state machine; stats calculation
+      change: extract from data.json to own table; fix D3; remove daily-note write path
+
+    - source: src/types.ts ICSEvent / ICSCache shapes
+      adopt_into: ics_events / ics_subscriptions tables
+      value: Clean ICS event model with recurrence, all-day, color
+      change: evict from data.json; fix D3; subscriptionId becomes FK not string key
+
+    - source: TimeBlock shape (daily-note frontmatter)
+      adopt_into: timeblocks table (FK to daily-note blocks.id)
+      value: Timeblock model with attachments[]
+      change: extract from DailyNoteFrontmatter; FK to blocks.id not path
+
+    - source: src/api/TaskNotesAPI.ts (REST endpoint set)
+      adopt_into: jlnotion HTTP API surface
+      value: Comprehensive CRUD + filter + calendar + pomodoro + time-tracking endpoints
+      change: large file; wire through jlnotion service layer; remove direct plugin references
+
+    - source: SavedView / FilterQuery (data.json)
+      adopt_into: saved_views table
+      value: Named persistent filter + sort + group + visible-property configs
+      change: move out of data.json; fix D3
+
+  tier3_skip:
+    - source: src/i18n/ (12 locales, ~40k LOC)
+      reason: UI strings; no engine value
+
+    - source: styles/ (30 CSS files)
+      reason: pure UI
+
+    - source: src/settings/ (tabs, components, migration)
+      reason: settings boilerplate; data.json out_of_db_scope
+
+    - source: src/bootstrap/pluginBootstrap.ts (ribbon/view registration, lazy init)
+      reason: Obsidian plugin lifecycle plumbing; not adoptable
+
+    - source: src/services/GoogleCalendarService.ts / MicrosoftCalendarService.ts / OAuthService.ts
+      reason: OAuth + external API; network layer; no engine value in isolation
+      note: data shapes (GoogleCalendarEvent, OAuthTokens) are worth extracting as types
+
+    - source: e2e/, tests/ (~500 issue-specific unit tests)
+      reason: test suite; reference only for edge-case inventory
+
+    - source: docs-builder/, docs/spec/conformance/
+      reason: documentation build infrastructure
+
+sqlite_abstraction:
+  note: >
+    All tables are CACHE PROJECTIONS of vault files.
+    writes_go_to_files: true  |  rebuildable: true  |  no_fts5: true
+    Search = LIKE/GLOB on text columns. render_only columns not written back to vault.
+
+  tables:
+
+    - name: tasks
+      note: one row per task file; PK = blocks.id FK; path via join
+      columns:
+        - { name: id,                    type: TEXT NOT NULL,      note: FK -> blocks.id }
+        - { name: title,                 type: TEXT NOT NULL }
+        - { name: status,                type: TEXT NOT NULL }
+        - { name: priority,              type: TEXT NOT NULL }
+        - { name: due,                   type: TEXT,               note: YYYY-MM-DD }
+        - { name: scheduled,             type: TEXT,               note: YYYY-MM-DD }
+        - { name: completed_date,        type: TEXT,               note: YYYY-MM-DD }
+        - { name: date_created,          type: TEXT,               note: ISO timestamp }
+        - { name: date_modified,         type: TEXT,               note: ISO timestamp }
+        - { name: archived,              type: INTEGER NOT NULL DEFAULT 0 }
+        - { name: recurrence,            type: TEXT,               note: RFC 5545 RRULE string }
+        - { name: recurrence_anchor,     type: TEXT,               note: "'scheduled'|'completion'" }
+        - { name: recurrence_parent_id,  type: TEXT,               note: FK -> tasks.id (NULL if not occurrence) }
+        - { name: occurrence_date,       type: TEXT,               note: YYYY-MM-DD; materialized only }
+        - { name: occurrence_materialization, type: TEXT }
+        - { name: occurrence_next_trigger,    type: TEXT }
+        - { name: time_estimate,         type: INTEGER,            note: minutes }
+        - { name: total_tracked_time,    type: INTEGER,            render_only: true, note: derived from time_entries }
+        - { name: sort_order,            type: TEXT,               render_only: true, note: LexoRank; D4 }
+        - { name: is_blocked,            type: INTEGER,            render_only: true, note: derived from blocked_by + status }
+        - { name: is_blocking,           type: INTEGER,            render_only: true, note: derived from blocking }
+        - { name: has_subtasks,          type: INTEGER,            render_only: true, note: derived from projects backref }
+        - { name: details,               type: TEXT,               note: task body (non-frontmatter content) }
+      constraints:
+        - "PK(id)"
+        - "FK(id) REFERENCES blocks(id) ON UPDATE CASCADE"
+        - "FK(recurrence_parent_id) REFERENCES tasks(id)"
+
+    - name: task_tags
+      note: normalized tags[], contexts[], projects[] arrays
+      columns:
+        - { name: task_id,  type: TEXT NOT NULL, note: FK -> tasks.id }
+        - { name: kind,     type: TEXT NOT NULL, note: "'tag'|'context'|'project'" }
+        - { name: value,    type: TEXT NOT NULL }
+      constraints:
+        - "PK(task_id, kind, value)"
+
+    - name: task_complete_instances
+      note: complete_instances[] and skipped_instances[] for recurring tasks
+      columns:
+        - { name: task_id,  type: TEXT NOT NULL,  note: FK -> tasks.id (parent recurring task) }
+        - { name: date,     type: TEXT NOT NULL,  note: YYYY-MM-DD }
+        - { name: kind,     type: TEXT NOT NULL,  note: "'completed'|'skipped'" }
+      constraints:
+        - "PK(task_id, date, kind)"
+
+    - name: task_time_entries
+      note: normalized timeEntries[] (D5 fix)
+      columns:
+        - { name: id,          type: TEXT NOT NULL,  note: surrogate uuid }
+        - { name: task_id,     type: TEXT NOT NULL,  note: FK -> tasks.id }
+        - { name: start_time,  type: TEXT NOT NULL,  note: ISO timestamp }
+        - { name: end_time,    type: TEXT,           note: NULL if running }
+        - { name: description, type: TEXT }
+        - { name: duration,    type: INTEGER,        render_only: true, note: derived seconds; legacy compat }
+        - { name: ord,         type: INTEGER NOT NULL }
+      constraints:
+        - "PK(id)"
+        - "FK(task_id) REFERENCES tasks(id) ON DELETE CASCADE"
+
+    - name: task_reminders
+      note: normalized reminders[]
+      columns:
+        - { name: id,             type: TEXT NOT NULL }
+        - { name: task_id,        type: TEXT NOT NULL,  note: FK -> tasks.id }
+        - { name: type,           type: TEXT NOT NULL,  note: "'absolute'|'relative'" }
+        - { name: related_to,     type: TEXT,           note: "'due'|'scheduled'" }
+        - { name: offset,         type: TEXT,           note: ISO 8601 duration }
+        - { name: absolute_time,  type: TEXT,           note: ISO timestamp }
+        - { name: description,    type: TEXT }
+      constraints:
+        - "PK(id)"
+        - "FK(task_id) REFERENCES tasks(id) ON DELETE CASCADE"
+
+    - name: task_blocked_by
+      note: normalized blockedBy[] (separate from backlinks and canvas edges — D1/layer invariant)
+      columns:
+        - { name: task_id,   type: TEXT NOT NULL,  note: FK -> tasks.id (the blocked task) }
+        - { name: uid,       type: TEXT NOT NULL,  note: wikilink/path of blocking task }
+        - { name: reltype,   type: TEXT NOT NULL,  note: FINISHTOSTART|FINISHTOFINISH|STARTTOSTART|STARTTOFINISH }
+        - { name: gap,       type: TEXT,           note: ISO 8601 duration }
+      constraints:
+        - "PK(task_id, uid)"
+        - "FK(task_id) REFERENCES tasks(id) ON DELETE CASCADE"
+
+    - name: timeblocks
+      note: TimeBlock[] from daily-note frontmatter; FK to daily note blocks.id
+      columns:
+        - { name: id,          type: TEXT NOT NULL }
+        - { name: daily_id,    type: TEXT NOT NULL,  note: FK -> blocks.id of daily note }
+        - { name: title,       type: TEXT NOT NULL }
+        - { name: start_time,  type: TEXT NOT NULL,  note: HH:MM }
+        - { name: end_time,    type: TEXT NOT NULL,  note: HH:MM }
+        - { name: color,       type: TEXT }
+        - { name: description, type: TEXT }
+      constraints:
+        - "PK(id)"
+        - "FK(daily_id) REFERENCES blocks(id)"
+
+    - name: timeblock_attachments
+      note: normalized attachments[] (markdown links to tasks/notes)
+      columns:
+        - { name: timeblock_id,  type: TEXT NOT NULL }
+        - { name: link,          type: TEXT NOT NULL }
+        - { name: ord,           type: INTEGER NOT NULL }
+      constraints:
+        - "PK(timeblock_id, ord)"
+
+    - name: pomodoro_sessions
+      note: extracted from data.json pomodoroHistory (D3 fix)
+      columns:
+        - { name: id,               type: TEXT NOT NULL }
+        - { name: task_id,          type: TEXT,           note: FK -> tasks.id (nullable) }
+        - { name: start_time,       type: TEXT NOT NULL,  note: ISO timestamp }
+        - { name: end_time,         type: TEXT,           note: ISO timestamp }
+        - { name: planned_duration, type: INTEGER NOT NULL, note: minutes }
+        - { name: type,             type: TEXT NOT NULL,  note: "'work'|'short-break'|'long-break'" }
+        - { name: completed,        type: INTEGER NOT NULL }
+        - { name: interrupted,      type: INTEGER }
+      constraints:
+        - "PK(id)"
+        - "FK(task_id) REFERENCES tasks(id) ON DELETE SET NULL"
+
+    - name: pomodoro_active_periods
+      note: PomodoroTimePeriod[] for pause/resume tracking
+      columns:
+        - { name: session_id,  type: TEXT NOT NULL }
+        - { name: start_time,  type: TEXT NOT NULL }
+        - { name: end_time,    type: TEXT }
+        - { name: ord,         type: INTEGER NOT NULL }
+      constraints:
+        - "PK(session_id, ord)"
+
+    - name: ics_subscriptions
+      note: ICSSubscription config; out_of_db_scope settings fields excluded
+      columns:
+        - { name: id,              type: TEXT NOT NULL }
+        - { name: name,            type: TEXT NOT NULL }
+        - { name: url,             type: TEXT }
+        - { name: file_path,       type: TEXT }
+        - { name: type,            type: TEXT NOT NULL,  note: "'remote'|'local'" }
+        - { name: color,           type: TEXT NOT NULL }
+        - { name: enabled,         type: INTEGER NOT NULL }
+        - { name: refresh_interval,type: INTEGER NOT NULL, note: minutes }
+      constraints:
+        - "PK(id)"
+
+    - name: ics_events
+      note: ICSEvent from ICSCache; cache projection of remote/local ICS data
+      columns:
+        - { name: id,                  type: TEXT NOT NULL }
+        - { name: subscription_id,     type: TEXT NOT NULL,  note: FK -> ics_subscriptions.id }
+        - { name: title,               type: TEXT NOT NULL }
+        - { name: description,         type: TEXT }
+        - { name: start,               type: TEXT NOT NULL,  note: ISO timestamp }
+        - { name: end,                 type: TEXT }
+        - { name: all_day,             type: INTEGER NOT NULL }
+        - { name: location,            type: TEXT }
+        - { name: url,                 type: TEXT }
+        - { name: rrule,               type: TEXT }
+        - { name: recurring_event_id,  type: TEXT }
+        - { name: color,               type: TEXT }
+        - { name: last_updated,        type: TEXT NOT NULL,  note: ISO timestamp }
+        - { name: expires,             type: TEXT NOT NULL,  note: ISO timestamp }
+      constraints:
+        - "PK(id, subscription_id)"
+        - "FK(subscription_id) REFERENCES ics_subscriptions(id) ON DELETE CASCADE"
+
+    - name: saved_views
+      note: extracted from data.json (D3 fix); serialized FilterQuery as JSON blob
+      columns:
+        - { name: id,                  type: TEXT NOT NULL }
+        - { name: name,                type: TEXT NOT NULL }
+        - { name: query_json,          type: TEXT NOT NULL,  note: JSON-serialized FilterQuery }
+        - { name: view_options_json,   type: TEXT }
+        - { name: visible_properties,  type: TEXT,           note: JSON array of property IDs }
+      constraints:
+        - "PK(id)"
+
+  derivation_sql_sketch:
+    note: illustrative — not executed by plugin; for indexer reference
+
+    total_tracked_time: |
+      -- render_only column; recomputed on rebuild
+      UPDATE tasks SET total_tracked_time = (
+        SELECT COALESCE(SUM(
+          CAST((julianday(COALESCE(end_time, datetime('now'))) - julianday(start_time)) * 1440 AS INTEGER)
+        ), 0)
+        FROM task_time_entries WHERE task_id = tasks.id
+      );
+
+    is_blocked: |
+      -- render_only; requires status join; CONFLICT(D1) — uid must resolve to tasks.id
+      UPDATE tasks SET is_blocked = (
+        SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
+        FROM task_blocked_by tb
+        JOIN tasks blocker ON blocker.id = tb.uid  -- uid = path; join via blocks.id
+        JOIN tasks self ON self.id = tb.task_id
+        WHERE tb.task_id = tasks.id
+          AND blocker.status NOT IN (SELECT value FROM status_config WHERE is_completed = 1)
+      );
+
+    recurrence_next_due: |
+      -- procedural_transform; rrule expansion not SQL-native; record as derivation sketch only
+      -- indexer must call rrule.after(lastCompleted) in JS, store result in tasks.due on rebuild
+
+compatibility:
+  obsidian_api:
+    metadataCache_changed: COMPATIBLE
+    fileManager_processFrontMatter: COMPATIBLE
+    vault_create_modify: COMPATIBLE
+    vault_rename: COMPATIBLE
+    registerEditorExtension_codemirror: COMPATIBLE
+    registerMarkdownPostProcessor: COMPATIBLE
+    obsidian_daily_notes_interface: COMPATIBLE  # external dep, not core API
+
+  jl_notion_invariants:
+    writes_to_files:
+      score: COMPATIBLE
+      note: All task mutations via fileManager.processFrontMatter or vault.create/modify.
+            Exception: data.json (pomodoro, ICS, OAuth, saved views, auto-archive queue) — see D3.
+
+    db_is_read_cache:
+      score: COMPATIBLE
+      note: TaskManager explicitly documented as "just-in-time, no internal cache".
+            pendingTaskInfoByPath is a transient write-ahead buffer, not authoritative state.
+            data.json state (D3) is out_of_db_scope except pomodoro/ICS/saved_views which
+            must be promoted to proper tables.
+
+    blocks_id_identity:
+      score: "CONFLICT(D1)"
+      note: TaskInfo.id = file.path throughout. No surrogate ID.
+            Fix: wrap in FK -> blocks.id at indexer boundary; all cross-refs resolve via path join.
+
+    global_property_registry:
+      score: COMPATIBLE
+      note: FieldMapping is vault-global; UserMappedField[] is plugin-wide config.
+            Per-file overrides do not exist. Consistent with jlnotion global property registry.
+
+    separate_link_layers:
+      score: COMPATIBLE
+      note: blockedBy[] (task_blocked_by table), backlinks (Obsidian native), and
+            canvas edges are explicitly NOT conflated in the type model. Dependency
+            link layer is its own typed array with reltype + gap.
+
+    render_only_geometry:
+      score: COMPATIBLE
+      note: sortOrder (LexoRank) is the only geometry-like field; treated as D4 and
+            flagged render_only. timeblocks startTime/endTime are data, not render geometry.
+
+    no_fts5:
+      score: COMPATIBLE
+      note: Plugin uses metadataCache (not FTS) for text search. FilterOperators
+            "contains"/"does-not-contain" map to LIKE-scan on text columns.
+
+  writeguard_required: true
+  writeguard_triggers:
+    - processFrontMatter in TaskService (8 call sites) — mark path in-flight, suppress echo
+    - vault.modify in TaskUpdateService (body rewrite) — same guard
+    - KanbanView direct processFrontMatter (line 3728, D2) — must route through TaskService
+    - CalendarView direct processFrontMatter (line 2181) — same
+
+  risk: MED
+  risk_rationale: >
+    No FTS5, no conflated link layers, vault-primary writes. Risk is MED not LOW because:
+    (1) D1 path-identity requires systematic FK wrapping at every cross-reference site
+    (2) D3 data.json multiplexing requires extraction of 4 state domains before full adoption
+    (3) D2 write-echo requires WriteGuard instrumentation at 10+ call sites
+    Geometry/render columns are clean. No raw DB; no blocking SQLite conflicts.
+
+  net_assessment: >
+    partial — high-value task model, recurrence engine, and filter AST are directly
+    adoptable; data.json state (D3), path-identity (D1), and write-echo (D2) require
+    targeted fixes before extraction.
+
+open_questions:
+  - id: OQ1
+    blocking: false
+    status: RESOLVED 2026-06-06
+    decision: indexer-boundary-only
+    rationale: >
+      Resolve path->blocks.id at read time via join inside the cache layer.
+      Vault frontmatter cross-references (blockedBy.uid, projects[], etc.) are never
+      rewritten. Path strings remain as-is in files; translation happens only inside
+      the cache on ingest.
+
+  - id: OQ2
+    status: "N/A — pomodoro and ICS not in scope"
+
+  - id: OQ3
+    status: "N/A — recurrence not in scope"
+
+  - id: OQ4
+    status: "N/A — MCP/HTTP API not in scope"
